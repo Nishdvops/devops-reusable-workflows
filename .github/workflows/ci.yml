@@ -1,0 +1,134 @@
+# Reusable CI workflow.
+# Callers reference this file at @main, a release tag, or a commit SHA.
+
+name: CI
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: Image name published under ghcr.io/OWNER
+        required: true
+        type: string
+      test-command:
+        description: Shell command that runs the caller repository tests
+        required: true
+        type: string
+      dockerfile:
+        description: Dockerfile path in the caller repository
+        required: false
+        type: string
+        default: docker/Dockerfile
+      context:
+        description: Docker build context in the caller repository
+        required: false
+        type: string
+        default: "."
+      trivy-severity:
+        description: Vulnerability severities that fail the image scan
+        required: false
+        type: string
+        default: CRITICAL,HIGH
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Validate image name
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+        run: |
+          if ! printf '%s' "$IMAGE_NAME" | grep -Eq '^[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*$'; then
+            echo "Invalid image-name: '$IMAGE_NAME'."
+            echo "Use lowercase letters, digits, and separators '.', '_', '__', or '-'."
+            echo "The name must start and end with a letter or digit."
+            exit 1
+          fi
+          if [ "${#IMAGE_NAME}" -gt 128 ]; then
+            echo "Invalid image-name: must be 128 characters or fewer."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run tests
+        env:
+          TEST_COMMAND: ${{ inputs.test-command }}
+        run: bash -c "$TEST_COMMAND"
+
+      - name: Build image
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          CONTEXT: ${{ inputs.context }}
+          LOCAL_IMAGE: local/${{ inputs.image-name }}:${{ github.sha }}
+        run: docker build -f "$DOCKERFILE" -t "$LOCAL_IMAGE" "$CONTEXT"
+
+      - name: Scan image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: local/${{ inputs.image-name }}:${{ github.sha }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: false
+          severity: ${{ inputs.trivy-severity }}
+
+      - name: Save scanned image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          LOCAL_IMAGE: local/${{ inputs.image-name }}:${{ github.sha }}
+        run: docker save "$LOCAL_IMAGE" -o "${{ runner.temp }}/image.tar"
+
+      - name: Upload scanned image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: scanned-image
+          path: ${{ runner.temp }}/image.tar
+          retention-days: 1
+
+  publish:
+    needs: validate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download scanned image
+        uses: actions/download-artifact@v4
+        with:
+          name: scanned-image
+          path: ${{ runner.temp }}/scanned-image
+
+      - name: Load scanned image
+        run: docker load -i "${{ runner.temp }}/scanned-image/image.tar"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        env:
+          LOCAL_IMAGE: local/${{ inputs.image-name }}:${{ github.sha }}
+          OWNER: ${{ github.repository_owner }}
+          IMAGE_NAME: ${{ inputs.image-name }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          owner="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          image_name="$(printf '%s' "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')"
+          target="ghcr.io/${owner}/${image_name}"
+          docker tag "$LOCAL_IMAGE" "${target}:${GIT_SHA}"
+          docker tag "$LOCAL_IMAGE" "${target}:latest"
+          docker push "${target}:${GIT_SHA}"
+          docker push "${target}:latest"
